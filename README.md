@@ -5,11 +5,10 @@ Currently training at **Cyfrin Updraft**.
 
 ---
 
-## 📋 Reports
-
 | Protocol | Severity Findings | Type | Report |
 |----------|------------------|------|--------|
 | PasswordStore | 1 Critical, 1 High, 1 Informational | Educational / Cyfrin | [View Report](./reports/PasswordStore-Bug-Report-Cyfrin.md) |
+| Puppy Raffle | 3 High, 3 Medium, 1 Low, 7 Info, 2 Gas | Educational / Cyfrin | [View Report](./puppy-raffle/puppy-raffle-audit-report.md) |
 
 ---
 

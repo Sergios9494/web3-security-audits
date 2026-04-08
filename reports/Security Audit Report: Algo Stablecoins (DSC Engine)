@@ -1,0 +1,313 @@
+# Security Audit Report: Algo Stablecoins (DSC Engine)
+
+**Contest:** CodeHawks — First Flights -algo-ssstablecoinsss
+**Date:** 2026-04-08
+**Platform:** Vyper 0.4.0 / Moccasin
+**Repo:** https://github.com/CodeHawks-Contests/ai-algo-ssstablecoinsss
+**Scope:** `src/dsc_engine.vy` · `src/decentralized_stable_coin.vy` · `src/oracle_lib.vy`
+**nSLOC:** ~260
+**Auditor:** Independent Security Review
+**Result:** 2/2 H/M vulnerabilities identified (100%)
+
+---
+
+## Protocol Overview
+
+Algo Stablecoins is a decentralized, over-collateralized CDP (Collateralized Debt Position) stablecoin protocol written in Vyper 0.4.0. Users deposit WETH or WBTC as collateral and mint DSC — a USD-pegged stablecoin — against it. The protocol enforces a 200% collateralization ratio (LIQUIDATION_THRESHOLD = 50%) via a health factor check. Positions that fall below the minimum health factor can be liquidated by external keepers who receive a 10% collateral bonus.
+
+**Core contracts:**
+
+| Contract | Role |
+|---|---|
+| `dsc_engine.vy` | Main coordinator. Handles deposit, mint, redeem, burn, liquidate. Holds all user collateral. |
+| `decentralized_stable_coin.vy` | Snekmate ERC-20 DSC token. DSCEngine is the sole authorized minter/burner. |
+| `oracle_lib.vy` | Chainlink price feed wrapper. Provides staleness-checked USD prices for all collateral valuations. |
+
+**Key invariant:** `health_factor = (collateral_value_USD × 50%) / dsc_minted ≥ 1e18`
+
+---
+
+## Findings Summary
+
+| ID | Severity | Title | Status |
+|---|---|---|---|
+| H-01 | **High** | `MIN_HEALTH_FACTOR` calibrated only for WETH — WBTC positions always breach it | Confirmed |
+| M-01 | **Medium** | Oracle staleness `TIMEOUT = 72 hours` — too permissive for Chainlink heartbeats | Confirmed |
+
+---
+
+## Detailed Findings
+
+---
+
+### [H-01] `MIN_HEALTH_FACTOR` Is Calibrated Only for WETH — WBTC Positions Always Breach It
+
+**Severity:** High
+**Scope:** `src/dsc_engine.vy`
+
+---
+
+**Description**
+
+The protocol accepts two collateral tokens: WETH (18 decimals) and WBTC (8 decimals). The health factor check in `_revert_if_health_factor_is_broken` compares the user's computed health factor against `MIN_HEALTH_FACTOR = 10**18`:
+
+```vyper
+# dsc_engine.vy
+MIN_HEALTH_FACTOR: public(constant(uint256)) = 1 * (10**18)
+PRECISION: public(constant(uint256)) = 1 * (10**18)
+ADDITIONAL_FEED_PRECISION: public(constant(uint256)) = 1 * (10**10)
+
+@internal
+def _revert_if_health_factor_is_broken(user: address):
+    user_health_factor: uint256 = self._health_factor(user)
+    assert (
+        user_health_factor >= MIN_HEALTH_FACTOR  # only valid for 18-decimal tokens
+    ), "DSCEngine__BreaksHealthFactor"
+```
+
+The health factor is derived from `_get_usd_value`, which converts a deposited token `amount` into a USD value using this formula:
+
+```vyper
+# dsc_engine.vy:314-316
+@internal
+@view
+def _get_usd_value(token: address, amount: uint256) -> uint256:
+    ...
+    return (
+        (convert(price, uint256) * ADDITIONAL_FEED_PRECISION) * amount
+    ) // PRECISION
+```
+
+This formula was written assuming `amount` is always expressed in **18-decimal units** (like WETH). However, WBTC uses **8 decimals** (satoshi units). The contract stores the raw token amount from `transferFrom` without any decimal normalization. When WBTC's 8-decimal `amount` is passed into `_get_usd_value`, the result is **1e10 times smaller** than the true USD value — because the division by `PRECISION = 1e18` is not offset by the missing 10 decimal places.
+
+The constant `MIN_HEALTH_FACTOR = 1e18` was calibrated for WETH where 18-decimal amounts produce health factor values in the `1e18` range. For WBTC positions, the health factor is `1e10` times smaller than expected, making it **permanently impossible** to meet `MIN_HEALTH_FACTOR` with any meaningful DSC balance.
+
+---
+
+**Impact**
+
+WBTC depositors cannot mint any meaningful amount of DSC. The maximum mintable DSC for 1 WBTC at $60,000 is 3,000 wei (0.000003 DSC). Any attempt to mint more reverts in `_revert_if_health_factor_is_broken`. WBTC is rendered non-functional as collateral despite being a listed and supported token in the protocol.
+
+Additionally, `_get_token_amount_from_usd` — used during liquidation to calculate how much WBTC to award the liquidator — has the inverse bug: it overestimates WBTC token amounts by `1e10`. Liquidating any WBTC-backed position would attempt to transfer `1e10` times more WBTC than exists in the contract, causing all WBTC liquidations to revert.
+
+---
+
+**Proof of Concept**
+
+Tracing the math for 1 WBTC deposited at $60,000:
+
+```
+# Chainlink BTC/USD price (8-decimal feed)
+price = 60,000 × 1e8 = 6e12
+
+# _get_usd_value calculation
+ADDITIONAL_FEED_PRECISION = 1e10
+PRECISION                 = 1e18
+amount (1 WBTC, satoshis) = 1e8
+
+_get_usd_value = (6e12 × 1e10 × 1e8) / 1e18
+               = 6e30 / 1e18
+               = 6e12
+
+# Expected: $60,000 in 1e18 form = 60,000 × 1e18 = 6e22
+# Actual:                                            6e12
+# Error factor: 6e22 / 6e12 = 1e10  (ten billion times too small)
+```
+
+Health factor calculation for this position:
+
+```
+collateral_adjusted = 6e12 × LIQUIDATION_THRESHOLD / LIQUIDATION_PRECISION
+                    = 6e12 × 50 / 100
+                    = 3e12
+
+health_factor = (3e12 × 1e18) / dsc_minted
+
+# For health_factor >= MIN_HEALTH_FACTOR (1e18):
+#   3e30 / dsc_minted >= 1e18
+#   dsc_minted <= 3e12 wei = 0.000003 DSC
+
+# Attempting to mint 1 DSC (1e18 wei):
+health_factor = 3e30 / 1e18 = 3e12
+MIN_HEALTH_FACTOR            = 1e18
+3e12 < 1e18 → REVERT "DSCEngine__BreaksHealthFactor"
+```
+
+Comparison with equivalent WETH position at $3,000 per ETH:
+
+```
+# 1 WETH (18 decimals), amount = 1e18
+_get_usd_value = (3e11 × 1e10 × 1e18) / 1e18 = 3e21  ✓ ($3,000 correctly valued)
+
+collateral_adjusted = 3e21 × 50 / 100 = 1.5e21
+health_factor (minting 1000 DSC) = (1.5e21 × 1e18) / 1e21 = 1.5e18 ✓ above MIN_HEALTH_FACTOR
+
+# Same 1000 DSC on WBTC (worth 20x more in USD):
+health_factor = (3e12 × 1e18) / 1e21 = 3e9  ← permanently reverts
+```
+
+---
+
+**Mitigation**
+
+Normalize the deposited `amount` to 18 decimal places inside `_get_usd_value` before dividing by `PRECISION`. Store each collateral token's decimal precision at construction and apply the normalization factor:
+
+```vyper
+# Add to storage variables
+token_address_to_decimals: HashMap[address, uint256]
+
+# In __init__, store decimals for each collateral token:
+self.token_address_to_decimals[token_addresses[0]] = 18  # WETH
+self.token_address_to_decimals[token_addresses[1]] = 8   # WBTC
+
+# Updated _get_usd_value:
+@internal
+@view
+def _get_usd_value(token: address, amount: uint256) -> uint256:
+    ...
+    decimals: uint256 = self.token_address_to_decimals[token]
+    normalized_amount: uint256 = amount * (10 ** (18 - decimals))
+    return (
+        (convert(price, uint256) * ADDITIONAL_FEED_PRECISION) * normalized_amount
+    ) // PRECISION
+```
+
+Apply the same normalization in `_get_token_amount_from_usd`:
+
+```vyper
+@internal
+@view
+def _get_token_amount_from_usd(token: address, usd_amount_in_wei: uint256) -> uint256:
+    ...
+    decimals: uint256 = self.token_address_to_decimals[token]
+    raw_amount: uint256 = (
+        (usd_amount_in_wei * PRECISION) //
+        (convert(price, uint256) * ADDITIONAL_FEED_PRECISION)
+    )
+    # Convert from 18-decimal normalized back to token's native decimals
+    return raw_amount // (10 ** (18 - decimals))
+```
+
+With this fix, 1 WBTC (1e8 satoshis) normalizes to 1e18 before calculation, producing the correct $60,000 valuation and a health factor in the expected `1e18` range — consistent with WETH behavior.
+
+---
+
+### [M-01] Oracle Staleness `TIMEOUT = 72 Hours` Allows Stale Price Exploitation
+
+**Severity:** Medium
+**Scope:** `src/oracle_lib.vy` · `src/dsc_engine.vy`
+
+---
+
+**Description**
+
+The `oracle_lib` module protects against stale Chainlink prices by reverting if the time since the last price update exceeds `TIMEOUT`. This ensures the protocol only operates on fresh price data:
+
+```vyper
+# oracle_lib.vy
+TIMEOUT: constant(uint256) = 72 * 3600  # 72 hours hardcoded
+
+@internal
+@view
+def _stale_check_latest_round_data(
+    price_feed: address,
+) -> (uint80, int256, uint256, uint256, uint80):
+    ...
+    seconds_since_last_update: uint256 = block.timestamp - updated_at
+    assert updated_at != 0, "OracleLib__StalePrice"
+    assert answered_in_round >= round_id, "OracleLib__StalePrice"
+    assert seconds_since_last_update <= TIMEOUT, "OracleLib__StalePrice"  # ← too permissive
+    return (round_id, price, started_at, updated_at, answered_in_round)
+```
+
+The `TIMEOUT` is hardcoded to 72 hours and applied identically to both collateral price feeds. However, the Chainlink feeds for the supported collateral tokens have much shorter heartbeats:
+
+| Feed | Chainlink Heartbeat | Protocol TIMEOUT | Excess Window |
+|---|---|---|---|
+| ETH/USD | 1 hour | 72 hours | **71 hours** |
+| BTC/USD | 24 hours | 72 hours | **48 hours** |
+
+This creates a window where a completely stale price — up to 71 hours old for ETH/USD — is accepted as valid. During this window, an attacker who monitors the real market price can exploit the divergence between the stale on-chain price and the true off-chain price to mint under-collateralized DSC or liquidate positions that are actually healthy.
+
+---
+
+**Impact**
+
+During any period where the Chainlink feed stops updating (network congestion, keeper failure, sequencer outage), the on-chain price becomes stale while the real market price continues to move. The protocol has no mechanism to detect this divergence for up to 71 hours on ETH/USD. An attacker can:
+
+1. **Over-mint DSC:** Deposit collateral at a stale high price, mint DSC at the inflated valuation, then watch the position become under-collateralized when the price corrects.
+2. **Liquidate healthy positions:** If the stale price is lower than the real price, positions appear undercollateralized and can be liquidated at a discount — taking collateral from users whose positions are actually safe.
+
+---
+
+**Proof of Concept**
+
+Step-by-step exploitation of the 71-hour ETH/USD window:
+
+```
+T = 0h     ETH/USD = $3,000. Chainlink feed updates normally every ~1 hour.
+
+T = 1h     Chainlink feed stops updating. On-chain price locked at $3,000.
+
+T = 24h    Real ETH price drops to $1,500 (50% crash, e.g. market panic).
+           Staleness check on-chain:
+             seconds_since_last_update = 24 × 3600 = 86,400s
+             TIMEOUT                   = 72 × 3600 = 259,200s
+             86,400 ≤ 259,200 → passes ✓  (stale price accepted as valid)
+
+           Attacker deposits 1 ETH.
+           Protocol values it at $3,000 (stale).
+           Attacker mints 1,500 DSC (50% of $3,000 stale value).
+
+           Real collateral value:  $1,500
+           Required for 1,500 DSC: $3,000 (200% ratio)
+           Actual ratio:           100%  ← under-collateralized in reality
+
+T = 72h    Chainlink feed resumes. Price updates to $1,500.
+           Attacker's position is immediately liquidatable.
+           Protocol has issued 1,500 DSC backed by only $1,500 collateral.
+           DSC solvency is compromised.
+```
+
+---
+
+**Mitigation**
+
+Replace the single hardcoded `TIMEOUT` constant with per-feed heartbeat values passed at construction. This aligns the staleness window exactly with each feed's guaranteed update frequency:
+
+```vyper
+# Add to storage
+token_address_to_heartbeat: HashMap[address, uint256]
+
+# In __init__, store heartbeat per collateral token's price feed:
+self.token_address_to_heartbeat[price_feed_addresses[0]] = 3600    # ETH/USD: 1 hour
+self.token_address_to_heartbeat[price_feed_addresses[1]] = 86400   # BTC/USD: 24 hours
+
+# Updated staleness check:
+@internal
+@view
+def _stale_check_latest_round_data(
+    price_feed: address,
+) -> (uint80, int256, uint256, uint256, uint80):
+    ...
+    seconds_since_last_update: uint256 = block.timestamp - updated_at
+    heartbeat: uint256 = self.token_address_to_heartbeat[price_feed]
+    assert updated_at != 0, "OracleLib__StalePrice"
+    assert answered_in_round >= round_id, "OracleLib__StalePrice"
+    assert seconds_since_last_update <= heartbeat, "OracleLib__StalePrice"
+    return (round_id, price, started_at, updated_at, answered_in_round)
+```
+
+Using the Chainlink-published heartbeat is safe because Chainlink guarantees a price update within that window under normal conditions. Any staleness beyond the heartbeat indicates a feed failure and the protocol should halt operations on that collateral rather than continue with an outdated price.
+
+---
+
+## Summary
+
+The Algo Stablecoins protocol has two confirmed vulnerabilities that directly undermine its core invariants:
+
+**H-01** breaks the protocol for an entire collateral class (WBTC). The decimal mismatch is silent — no transaction reverts on deposit, but minting DSC against WBTC is virtually impossible, and liquidations of WBTC positions are broken at the token math level.
+
+**M-01** breaks the protocol's price freshness guarantee during any oracle outage. A single hardcoded 72-hour timeout is too coarse for feeds with 1-hour heartbeats, creating a large exploitation window precisely when markets are most volatile.
+
+Both issues share a common root: the protocol hardcoded constants (`MIN_HEALTH_FACTOR`, `PRECISION`, `TIMEOUT`) that assume a single token type and a single price feed configuration, rather than parameterizing per collateral token. The fix in both cases is to store per-token / per-feed values at construction time.

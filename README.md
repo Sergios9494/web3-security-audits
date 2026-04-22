@@ -12,6 +12,7 @@ Currently training at **Cyfrin Updraft**.
 | Puppy Raffle | 3 High, 3 Medium, 1 Low, 7 Info, 2 Gas | Educational / Cyfrin | [View Report](./puppy-raffle/puppy-raffle-audit-report.md) |
 | Ethernaut Lv2 - Fallout | Constructor Typo | Ethernaut / OpenZeppelin | [View Report](./ethernaut/level2-fallout/ethernaut-level2-fallout.md) |
 | Algo Stablecoins | 1 High, 1 Medium | CodeHawks / First Flights | [View Report](./reports/algo-stablecoins-audit-report.md) |  
+| Santa's List | 5 High, 1 Medium | CodeHawks / First Flights | [View Report](reports/santas-list-audit-report.md) |
 
 ---
 

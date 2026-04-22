@@ -1,0 +1,408 @@
+# 🔐 Security Audit Report — Santa's List
+
+**AI First Flight #3 | CodeHawks**
+
+| | |
+|---|---|
+| Auditor | Independent AI Audit (Claude + Pashov Skills) |
+| Contest | AI First Flight #3 — Santa's List |
+| Audit Period | April 19–20, 2026 |
+| Contest Result | 5 / 7 H/M findings matched · 100 EXP earned |
+| Severity Distribution | 5 High · 1 Medium |
+| Tooling | x-ray (pre-audit scan) · solidity-auditor (8-agent parallel analysis) |
+
+---
+
+## Scope
+
+| | |
+|---|---|
+| Files Reviewed | src/SantasList.sol · src/SantaToken.sol |
+| nSLOC | ~116 |
+| Solidity Version | 0.8.x |
+| Framework | Foundry |
+
+---
+
+## Findings Summary
+
+| ID | Title | Severity | Status |
+|---|---|---|---|
+| H-01 | Missing Access Control on checkList Allows Anyone to Manipulate the Naughty/Nice List | High | ✅ Matched |
+| H-02 | Wrong Default Enum Value Allows Any Address to Collect a Free NFT | High | ✅ Matched |
+| H-03 | buyPresent Burns Tokens From Victim and Mints NFT to Caller | High | ✅ Matched |
+| H-04 | Already-Collected Guard Bypassed by Transferring the NFT | High | ✅ Matched |
+| H-05 | Malicious Code Injection in Vendored solmate ERC20 transferFrom | High | ❌ Missed |
+| H-06 | Malicious Test with vm.ffi() Enables Data Extraction From Developer | High | ❌ Missed |
+| M-01 | PURCHASED_PRESENT_COST Constant Is Never Enforced — Actual Cost Is Half the Stated Price | Medium | ✅ Matched |
+
+---
+
+## Detailed Findings
+
+---
+
+### [High] Missing Access Control on checkList Allows Anyone to Manipulate the Naughty/Nice List
+
+**Affected Files:** src/SantasList.sol
+
+**Description**
+
+SantasList maintains a mapping of addresses to their Status (NAUGHTY, NICE, EXTRA_NICE). Only Santa should be able to call checkList to assign statuses. The checkList function has no access control modifier — any address can call it to set any target address to any status.
+
+```solidity
+// src/SantasList.sol
+@> function checkList(address person, Status status) external {
+   // @> Missing: require(msg.sender == i_santa, "Only Santa can check the list");
+       s_theList[person] = status;
+   }
+```
+
+**Risk**
+
+- Any EOA or contract can call checkList at any time with no preconditions.
+- A griefing actor can deny NICE status by calling `checkList(victim, Status.NAUGHTY)` before Santa's check-in.
+
+**Impact**
+
+- Legitimate NICE users are blocked from collecting presents.
+- Attackers can set themselves to EXTRA_NICE to gain the highest reward tier.
+
+**Proof of Concept**
+
+```solidity
+function test_AnyoneCanCallCheckList() public {
+    address attacker = makeAddr("attacker");
+    address victim = makeAddr("victim");
+
+    vm.prank(santa);
+    santasList.checkList(victim, SantasList.Status.NICE);
+    assertEq(uint256(santasList.s_theList(victim)), uint256(SantasList.Status.NICE));
+
+    vm.prank(attacker);
+    santasList.checkList(victim, SantasList.Status.NAUGHTY);
+    assertEq(uint256(santasList.s_theList(victim)), uint256(SantasList.Status.NAUGHTY));
+
+    vm.warp(santasList.CHRISTMAS_2023_BLOCK_TIME() + 1);
+    vm.prank(victim);
+    vm.expectRevert();
+    santasList.collectPresent();
+}
+```
+
+**Recommended Mitigation**
+
+```diff
+- function checkList(address person, Status status) external {
++ function checkList(address person, Status status) external onlySanta {
+      s_theList[person] = status;
+  }
+```
+
+---
+
+### [High] Wrong Default Enum Value Allows Any Address to Collect a Free NFT
+
+**Affected Files:** src/SantasList.sol
+
+**Description**
+
+In Solidity, the default value of any enum is its first member (index 0). The Status enum is declared with NICE as its first member, meaning every address defaults to Status.NICE — including addresses Santa has never reviewed.
+
+```solidity
+@> enum Status {
+@>     NICE,        // index 0 — default for ALL unset addresses
+       EXTRA_NICE,
+       NAUGHTY,
+       NOT_CHECKED_TWICE
+   }
+
+   function collectPresent() external {
+@>     if (s_theList[msg.sender] == Status.NICE || s_theList[msg.sender] == Status.EXTRA_NICE) {
+           // ...mint present
+       }
+   }
+```
+
+**Risk**
+
+- Every address defaults to NICE — the vulnerable state is the starting state of the contract.
+- Anyone can mint a present without ever being added to Santa's list.
+
+**Impact**
+
+- The entire access-control model is broken at the default-value level.
+- The NFT supply can be fully drained by bots before legitimate users claim.
+
+**Proof of Concept**
+
+```solidity
+function test_DefaultNiceAllowsFreeNFT() public {
+    address stranger = makeAddr("stranger");
+    assertEq(uint256(santasList.s_theList(stranger)), uint256(SantasList.Status.NICE));
+
+    vm.warp(santasList.CHRISTMAS_2023_BLOCK_TIME() + 1);
+    vm.prank(stranger);
+    santasList.collectPresent();
+
+    assertEq(santasList.balanceOf(stranger), 1);
+}
+```
+
+**Recommended Mitigation**
+
+```diff
+  enum Status {
++     NOT_CHECKED_TWICE,  // index 0 — safe default
+      NICE,
+      EXTRA_NICE,
+-     NOT_CHECKED_TWICE,
+      NAUGHTY
+  }
+```
+
+---
+
+### [High] buyPresent Burns Tokens From Victim and Mints NFT to Caller
+
+**Affected Files:** src/SantasList.sol · src/SantaToken.sol
+
+**Description**
+
+The implementation inverts both operations: it burns tokens from `presentReceiver` (the recipient, not the payer) and mints the NFT to `msg.sender` (the caller, not the recipient).
+
+```solidity
+function buyPresent(address presentReceiver) external {
+@>  _burn(presentReceiver, PURCHASED_PRESENT_COST); // burns from RECIPIENT
+@>  _mintAndIncrement();                             // mints to msg.sender
+}
+```
+
+**Risk**
+
+- Any address that has approved SantasList to spend their SantaTokens is immediately at risk.
+- The attacker receives the NFT; the victim loses tokens and receives nothing.
+
+**Proof of Concept**
+
+```solidity
+function test_BuyPresentStealsFromVictim() public {
+    vm.prank(santa);
+    santasList.checkList(victim, SantasList.Status.EXTRA_NICE);
+    vm.warp(santasList.CHRISTMAS_2023_BLOCK_TIME() + 1);
+    vm.prank(victim);
+    santasList.collectPresent();
+
+    uint256 victimTokensBefore = santaToken.balanceOf(victim);
+
+    vm.prank(attacker);
+    santasList.buyPresent(victim);
+
+    assertLt(santaToken.balanceOf(victim), victimTokensBefore);
+    assertEq(santasList.balanceOf(attacker), 1);
+    assertEq(santasList.balanceOf(victim), 0);
+}
+```
+
+**Recommended Mitigation**
+
+```diff
+  function buyPresent(address presentReceiver) external {
+-     _burn(presentReceiver, PURCHASED_PRESENT_COST);
++     _burn(msg.sender, PURCHASED_PRESENT_COST);
+-     _mintAndIncrement();
++     _mint(presentReceiver, s_tokenCounter);
++     s_tokenCounter++;
+  }
+```
+
+---
+
+### [High] Already-Collected Guard Bypassed by Transferring the NFT
+
+**Affected Files:** src/SantasList.sol
+
+**Description**
+
+`collectPresent` uses `balanceOf(msg.sender) > 0` to prevent double collection. Because the NFT is a standard transferable ERC721, a user can transfer their present away, dropping their balance to zero, and collect again indefinitely.
+
+```solidity
+function collectPresent() external {
+@>  if (balanceOf(msg.sender) > 0) {          // only checks current balance
+        revert SantasList__AlreadyCollected(); // bypassed after NFT is transferred
+    }
+    _mintAndIncrement();
+}
+```
+
+**Impact**
+
+- Unlimited NFT minting by any single NICE address.
+- SantaToken rewards accumulate unboundedly.
+
+**Proof of Concept**
+
+```solidity
+function test_DoubleCollectViaTransfer() public {
+    vm.prank(santa);
+    santasList.checkList(alice, SantasList.Status.NICE);
+    vm.warp(santasList.CHRISTMAS_2023_BLOCK_TIME() + 1);
+
+    vm.prank(alice);
+    santasList.collectPresent();
+
+    vm.prank(alice);
+    santasList.transferFrom(alice, aliceWallet2, 0);
+    assertEq(santasList.balanceOf(alice), 0);
+
+    vm.prank(alice);
+    santasList.collectPresent();
+    assertEq(santasList.balanceOf(alice), 1);
+}
+```
+
+**Recommended Mitigation**
+
+```diff
++ mapping(address => bool) private s_alreadyCollected;
+
+  function collectPresent() external {
+-     if (balanceOf(msg.sender) > 0) {
+-         revert SantasList__AlreadyCollected();
+-     }
++     if (s_alreadyCollected[msg.sender]) {
++         revert SantasList__AlreadyCollected();
++     }
++     s_alreadyCollected[msg.sender] = true;
+      _mintAndIncrement();
+  }
+```
+
+---
+
+### [High] Malicious Code Injection in Vendored solmate ERC20 transferFrom
+
+**Affected Files:** lib/solmate/src/tokens/ERC20.sol
+
+**Description**
+
+The vendored copy of solmate's ERC20 `transferFrom` contains injected code not present in the official upstream release. Because SantaToken inherits from this vendored ERC20, every `transferFrom` call passes through the tampered code. This is a supply-chain attack invisible when auditing only `src/`.
+
+```solidity
+function transferFrom(address from, address to, uint256 amount) public virtual returns (bool) {
+    uint256 allowed = allowance[from][msg.sender];
+    if (allowed != type(uint256).max) allowance[from][msg.sender] = allowed - amount;
+@>  // INJECTED: unauthorized logic not present in official solmate upstream
+    balanceOf[from] -= amount;
+    unchecked { balanceOf[to] += amount; }
+    emit Transfer(from, to, amount);
+    return true;
+}
+```
+
+**Impact**
+
+- Every `transferFrom` on SantaToken executes injected code that can drain balances or redirect funds.
+
+**Proof of Concept**
+
+```bash
+git clone https://github.com/transmissions11/solmate --branch v6 /tmp/solmate-upstream
+diff lib/solmate/src/tokens/ERC20.sol /tmp/solmate-upstream/src/tokens/ERC20.sol
+```
+
+**Recommended Mitigation**
+
+```diff
+- # Vendored lib/ with manually modified files
++ forge install transmissions11/solmate@v6
++ # Verify: diff lib/solmate against upstream after every install
+```
+
+---
+
+### [High] Malicious Test with vm.ffi() Enables Arbitrary Shell Execution on Developer Machines
+
+**Affected Files:** foundry.toml · test/SantasList.t.sol
+
+**Description**
+
+`foundry.toml` enables `ffi = true` globally, and a test function calls `vm.ffi()` with a bash script. Any developer who runs `forge test` executes the shell commands automatically — opening a channel for silent exfiltration of private keys and secrets.
+
+```solidity
+function test_something() public {
+    string[] memory inputs = new string[](3);
+    inputs[0] = "bash";
+    inputs[1] = "-c";
+@>  inputs[2] = "..."; // bash payload
+@>  vm.ffi(inputs);
+}
+```
+
+**Impact**
+
+- Exfiltration of private keys, seed phrases, and SSH keys from any developer who runs the test suite.
+- CI/CD pipelines automatically expose deployment secrets.
+
+**Recommended Mitigation**
+
+```diff
+# foundry.toml
+- ffi = true
++ # ffi disabled — enable only in isolated profiles when required
+```
+
+---
+
+### [Medium] PURCHASED_PRESENT_COST Constant Is Never Enforced — Actual Cost Is Half the Stated Price
+
+**Affected Files:** src/SantasList.sol
+
+**Description**
+
+`buyPresent` uses a hardcoded literal `1e18` instead of the `PURCHASED_PRESENT_COST` constant (`2e18`). Users pay half the stated price.
+
+```solidity
+uint256 public constant PURCHASED_PRESENT_COST = 2e18;
+
+function buyPresent(address presentReceiver) external {
+@>  _burn(presentReceiver, 1e18); // ignores PURCHASED_PRESENT_COST
+    _mintAndIncrement();
+}
+```
+
+**Impact**
+
+- Token burn rate is 50% of intended — SantaToken deflates at half the designed speed.
+
+**Proof of Concept**
+
+```solidity
+function test_BuyPresentCostsHalfPrice() public {
+    deal(address(santaToken), caller, 2e18);
+    vm.prank(caller);
+    santasList.buyPresent(caller);
+    assertEq(santaToken.balanceOf(caller), 1e18); // half remaining
+}
+```
+
+**Recommended Mitigation**
+
+```diff
+- _burn(presentReceiver, 1e18);
++ _burn(presentReceiver, PURCHASED_PRESENT_COST);
+```
+
+---
+
+## Audit Summary
+
+| Metric | Value |
+|---|---|
+| Total findings submitted | 6 |
+| Matched H/M | 5 / 7 (71%) |
+| False positives | 1 (hardcoded timestamp) |
+| Missed H/M | 2 (supply chain: lib injection + FFI test) |
+| EXP earned | 100 |
+
+**Key lesson:** Supply-chain findings in `lib/` and `test/` are invisible when auditing only `src/`. On every future audit, diff vendored libraries against their official upstream commit and grep test files for `vm.ffi()`, `exec`, and network calls.

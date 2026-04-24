@@ -1,0 +1,508 @@
+# Security Audit Report — AirDropper (MerkleAirdrop)
+**AI First Flight #5 | CodeHawks**
+
+---
+
+| | |
+|---|---|
+| **Auditor** | Independent AI Security Audit |
+| **Methodology** | Static Analysis · Manual Review · Stateless Fuzzing · Invariant Testing · Pashov x-ray + solidity-auditor (8-agent) |
+| **Contest Period** | April 23–24, 2026 |
+| **Contest Result** | 4 / 4 H/M vulnerabilities identified (100%) |
+| **Files Reviewed** | `src/MerkleAirdrop.sol` · `script/Deploy.s.sol` |
+| **Chain** | zkSync Era |
+| **nSLOC** | 62 |
+| **Framework** | Foundry (foundry-zksync) |
+
+---
+
+## Executive Summary
+
+AirDropper is a gas-optimized Merkle airdrop protocol designed to distribute 100 USDC to four addresses on zkSync Era, verified using Merkle proof inclusion. The codebase is intentionally minimal (62 nSLOC across one contract and one deployment script).
+
+The audit identified **4 High severity vulnerabilities**, **1 Low severity vulnerability**, and **1 Informational finding**. All four High-severity findings were confirmed by the contest judges.
+
+The most critical finding is a complete absence of claim-replay protection in `MerkleAirdrop.sol`, which allows any valid proof to be used unlimited times to drain all deposited tokens. Three additional High-severity issues exist exclusively in `Deploy.s.sol`: a hardcoded USDC address typo that prevents any claim from succeeding, a Merkle root built with wrong decimal precision, and the use of Ethereum L1 addresses in a zkSync-targeted deployment that breaks Account Abstraction wallet holders.
+
+**No funds are safe in the current deployment configuration.**
+
+---
+
+## Scope
+
+| File | nSLOC | Role |
+|------|------:|------|
+| `src/MerkleAirdrop.sol` | 47 | Core airdrop contract: Merkle proof verification, token distribution, ETH fee collection |
+| `script/Deploy.s.sol` | ~15 | Deployment script: deploys `MerkleAirdrop` and funds it with USDC |
+
+**Out of scope:** `test/`, `makeMerkle.js`, `lib/`
+
+---
+
+## Audit Methodology
+
+### 1. Static Analysis (Pattern Detection)
+Manual pattern scanning across both files checking for:
+- Missing state updates after value-transferring operations
+- Access control gaps on privileged functions
+- Address literal typos and mismatch between related constants
+- Dead code and unreachable events
+- Incorrect token decimal assumptions
+
+**Slither** was run but could not compile due to missing OZ submodules. All static findings were confirmed through manual review.
+
+### 2. Stateless Fuzzing
+Fuzz tests were written targeting:
+- `claim()` with randomized `amount` values to confirm proof rejection on wrong amounts
+- `claim()` with randomized `fee` values to confirm fee gate behavior
+- Double-claim sequences to confirm the absence of replay protection
+
+```solidity
+function testFuzz_WrongAmountFailsProof(uint256 wrongAmount) public {
+    vm.assume(wrongAmount != amountToCollect);
+    vm.deal(collectorOne, airdrop.getFee());
+    vm.prank(collectorOne);
+    vm.expectRevert(MerkleAirdrop.MerkleAirdrop__InvalidProof.selector);
+    airdrop.claim{value: airdrop.getFee()}(collectorOne, wrongAmount, proof);
+}
+```
+
+### 3. Invariant Testing
+The following protocol invariants were defined and verified against the codebase:
+
+| Invariant | Status |
+|-----------|--------|
+| Each eligible address can claim at most once | **VIOLATED** — no `hasClaimed` mapping |
+| Total tokens distributed ≤ initial contract balance | **VIOLATED** — consequence of above |
+| `i_airdropToken` balance > 0 after deployment | **VIOLATED** — wrong address funded |
+| All Merkle leaf amounts match deployed token balance | **VIOLATED** — decimal mismatch |
+
+### 4. Symbolic / Formal Reasoning
+The double-hashed leaf construction `keccak256(bytes.concat(keccak256(abi.encode(account, amount))))` was verified to match the OpenZeppelin `StandardMerkleTree` format, confirming second-preimage resistance is correct. No mathematical vulnerabilities were found in the proof verification logic itself.
+
+### 5. Pashov x-ray + solidity-auditor (8-Agent Parallel)
+Both Pashov skills were executed:
+- **x-ray**: Generated threat model, architecture diagram, invariant map, git analysis
+- **solidity-auditor**: 8 specialized agents (vector scan, math precision, access control, economic security, execution trace, invariant, periphery, first-principles) ran in parallel
+
+All 8 agents independently flagged the missing `hasClaimed` mapping. The x-ray pre-audit scan identified the deploy script address mismatch and decimal inconsistency. The account abstraction finding required cross-referencing zkSync architecture documentation with the contract design.
+
+---
+
+## Findings Summary
+
+| ID | Title | Severity | File |
+|----|-------|----------|------|
+| H-01 | Wrong USDC Token Address in Deploy Script | High | `Deploy.s.sol` |
+| H-02 | Missing Claim Replay Protection | High | `MerkleAirdrop.sol` |
+| H-03 | Merkle Root Built with Wrong Token Decimals | High | `Deploy.s.sol` |
+| H-04 | Ethereum L1 Addresses Incompatible with zkSync AA Wallets | High | `Deploy.s.sol` |
+| L-01 | ETH Fee Economically Impractical for Owner to Recover | Low | `MerkleAirdrop.sol` |
+| I-01 | Dead `MerkleRootUpdated` Event | Informational | `MerkleAirdrop.sol` |
+
+---
+
+## Detailed Findings
+
+---
+
+### [H-01] Wrong USDC Token Address in Deploy Script Causes All Claims to Permanently Fail
+
+**Affected Files**: `script/Deploy.s.sol`
+
+#### Description
+
+The deploy script stores `s_zkSyncUSDC` as the USDC address passed to the `MerkleAirdrop` constructor, which stores it as the immutable `i_airdropToken`. A separate line then calls `transfer()` to fund the contract — but uses a **different hardcoded address** that differs at byte 9 of the hex string (`be` → `ae`).
+
+The contract is configured to distribute Token A but receives Token B. Since `i_airdropToken.balanceOf(address(this)) == 0`, every `claim()` call reverts.
+
+```solidity
+// script/Deploy.s.sol
+
+// @> Address used as i_airdropToken in constructor:
+address public s_zkSyncUSDC = 0x1D17CbCf0D6d143135be902365d2e5E2a16538d4;
+//                                                    ^^
+//                                                    'b' here
+
+function run() public {
+    vm.startBroadcast();
+    MerkleAirdrop airdrop = deployMerkleDropper(s_merkleRoot, IERC20(s_zkSyncUSDC));
+
+    // @> Address used to fund the contract:
+    IERC20(0x1d17CBcF0D6D143135aE902365D2E5e2A16538D4).transfer(address(airdrop), s_amountToAirdrop);
+    //                                              ^^
+    //                                              'a' here — DIFFERENT CONTRACT
+    vm.stopBroadcast();
+}
+```
+
+**Python confirmation:**
+```
+s_zkSyncUSDC  : 0x1d17cbcf0d6d143135be902365d2e5e2a16538d4
+transfer addr : 0x1d17cbcf0d6d143135ae902365d2e5e2a16538d4
+MATCH: False — differ at position 20: 'b' vs 'a'
+```
+
+#### Risk
+
+**Likelihood:**
+- Triggers on every `run()` execution — hardcoded and unconditional.
+- `i_airdropToken` is `immutable`; no on-chain fix exists after deployment.
+
+**Impact:**
+- All four eligible addresses are permanently unable to claim their 25 USDC allocation.
+- The 100 USDC deposited via the funding transfer is held by the contract but under the wrong token address, unrecoverable through standard claim/fee paths.
+
+#### Proof of Concept
+
+```solidity
+function test_H01_DeployAddressMismatch() public pure {
+    address configuredToken = 0x1D17CbCf0D6d143135bE902365d2e5E2a16538d4;
+    address fundingToken    = 0x1d17CBcF0D6D143135aE902365D2E5e2A16538D4;
+    assert(configuredToken != fundingToken);
+    // Contract holds fundingToken tokens but i_airdropToken = configuredToken
+    // configuredToken.balanceOf(address(airdrop)) == 0
+    // Every claim() → safeTransfer reverts with insufficient balance
+}
+```
+
+#### Recommended Mitigation
+
+```diff
+- address public s_zkSyncUSDC = 0x1D17CbCf0D6d143135be902365d2e5E2a16538d4;
++ address public s_zkSyncUSDC = 0x1d17CBcF0D6D143135aE902365D2E5e2A16538D4;
+```
+
+---
+
+### [H-02] Missing `hasClaimed` Mapping Allows Unlimited Proof Replay, Draining All Tokens
+
+**Affected Files**: `src/MerkleAirdrop.sol`
+
+#### Description
+
+`claim()` performs zero state writes on success. No `hasClaimed[account]` mapping or equivalent guard exists anywhere in the contract. Since Merkle proof verification is deterministic, the same `(account, amount, proof)` triple passes validation on every call, transferring `amount` tokens each time until the contract balance is zero.
+
+```solidity
+// src/MerkleAirdrop.sol
+
+function claim(address account, uint256 amount, bytes32[] calldata merkleProof) external payable {
+    if (msg.value != FEE) {
+        revert MerkleAirdrop__InvalidFeeAmount();
+    }
+    bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(account, amount))));
+    if (!MerkleProof.verify(merkleProof, i_merkleRoot, leaf)) {
+        revert MerkleAirdrop__InvalidProof();
+    }
+    emit Claimed(account, amount);
+    i_airdropToken.safeTransfer(account, amount);
+    // @> No storage write. hasClaimed[account] is never set.
+    // @> Proof remains valid for every future call indefinitely.
+}
+```
+
+#### Risk
+
+**Likelihood:**
+- Merkle tree data (addresses, amounts, proofs) is publicly derivable from `tree.json`; any observer can execute the attack immediately after the contract is funded.
+- Cost per replay: `1 gwei + gas` — economically negligible compared to any meaningful token value.
+
+**Impact:**
+- The entire 100 USDC balance can be drained in a single transaction loop for ~4 gwei total.
+- The three other eligible recipients receive nothing — the protocol's stated distribution goal is completely defeated.
+
+#### Proof of Concept
+
+```solidity
+function test_H02_ReplayDrainsEntireContract() public {
+    vm.deal(collectorOne, airdrop.getFee() * 4);
+    vm.startPrank(collectorOne);
+
+    // Same (account, amount, proof) replayed 4 times — all succeed
+    airdrop.claim{value: airdrop.getFee()}(collectorOne, amountToCollect, proof);
+    airdrop.claim{value: airdrop.getFee()}(collectorOne, amountToCollect, proof);
+    airdrop.claim{value: airdrop.getFee()}(collectorOne, amountToCollect, proof);
+    airdrop.claim{value: airdrop.getFee()}(collectorOne, amountToCollect, proof);
+    vm.stopPrank();
+
+    // Entire contract drained for 4 gwei
+    assertEq(token.balanceOf(address(airdrop)), 0);
+    assertEq(token.balanceOf(collectorOne), amountToCollect * 4);
+}
+```
+
+#### Recommended Mitigation
+
+```diff
++ mapping(address => bool) private s_hasClaimed;
++ error MerkleAirdrop__AlreadyClaimed();
+
+  function claim(address account, uint256 amount, bytes32[] calldata merkleProof) external payable {
+      if (msg.value != FEE) {
+          revert MerkleAirdrop__InvalidFeeAmount();
+      }
++     if (s_hasClaimed[account]) {
++         revert MerkleAirdrop__AlreadyClaimed();
++     }
+      bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(account, amount))));
+      if (!MerkleProof.verify(merkleProof, i_merkleRoot, leaf)) {
+          revert MerkleAirdrop__InvalidProof();
+      }
++     s_hasClaimed[account] = true;
+      emit Claimed(account, amount);
+      i_airdropToken.safeTransfer(account, amount);
+  }
+```
+
+---
+
+### [H-03] Merkle Root Generated with 18-Decimal Amounts but USDC Has 6 Decimals
+
+**Affected Files**: `script/Deploy.s.sol`
+
+#### Description
+
+`makeMerkle.js` generates the Merkle tree using `amount = 25 * 1e18` (ETH-scale), producing the root stored in `Deploy.s.sol`. However, USDC on zkSync uses 6 decimal places — the correct amount per recipient is `25 * 1e6`. The deploy script funds the contract with only `4 * (25 * 1e6) = 100e6` tokens.
+
+This creates an irreconcilable mismatch:
+- Calling `claim(account, 25e6, proof)` → `InvalidProof` (leaf was built with `25e18`)
+- Calling `claim(account, 25e18, proof)` → `safeTransfer` reverts (contract only holds `100e6` tokens, not `100e18`)
+
+```solidity
+// makeMerkle.js
+const amount = (25 * 1e18).toString()  // @> ETH-scale: 25_000_000_000_000_000_000
+
+// script/Deploy.s.sol
+bytes32 public s_merkleRoot = 0xf69aaa25bd4dd10deb2ccd8235266f7cc815f6e9d539e9f4d47cae16e0c36a05;
+// @> This root encodes 25e18 per leaf
+
+uint256 public s_amountToAirdrop = 4 * (25 * 1e6);
+// @> But only 100e6 USDC (6-decimal) is deposited — 1_000_000_000_000x less than each leaf
+```
+
+#### Risk
+
+**Likelihood:**
+- Structural to the current scripts — every deployment produces this mismatch without modification.
+- The test suite uses a separately-generated root (`0x3b2e2...`) with correct `25e6` amounts, confirming the production root (`0xf69aa...`) is incompatible with USDC's actual decimal count.
+
+**Impact:**
+- No eligible address can successfully claim regardless of which amount they supply.
+- Redeployment with a corrected Merkle root is the only resolution; all tokens in the original deployment are stranded.
+
+#### Proof of Concept
+
+```
+makeMerkle.js output:
+  Merkle Root: 0xf69aaa25bd4dd10deb2ccd8235266f7cc815f6e9d539e9f4d47cae16e0c36a05
+  (built with amount = 25e18)
+
+Deploy.s.sol:
+  s_merkleRoot = 0xf69aaa... (same as above)
+  s_amountToAirdrop = 100e6 USDC deposited
+
+Claim attempt A: claim(account, 25e6, proof_from_makeMerkle)
+  → leaf = keccak256(keccak256(abi.encode(account, 25e6)))
+  → stored leaf = keccak256(keccak256(abi.encode(account, 25e18)))
+  → MerkleProof.verify() → false → revert InvalidProof
+
+Claim attempt B: claim(account, 25e18, proof_from_makeMerkle)
+  → proof verifies correctly
+  → safeTransfer(account, 25e18) → reverts (balance = 100e6, need 25e18)
+```
+
+#### Recommended Mitigation
+
+```diff
+// makeMerkle.js
+- const amount = (25 * 1e18).toString()
++ const amount = (25 * 1e6).toString()   // USDC = 6 decimals
+
+// Re-run: yarn run makeMerkle → get corrected root, update Deploy.s.sol:
+- bytes32 public s_merkleRoot = 0xf69aaa25bd4dd10deb2ccd8235266f7cc815f6e9d539e9f4d47cae16e0c36a05;
++ bytes32 public s_merkleRoot = <root_generated_with_25e6_amounts>;
+```
+
+---
+
+### [H-04] Ethereum L1 Addresses in Merkle Tree Block Account Abstraction Wallet Holders on zkSync Era
+
+**Affected Files**: `script/Deploy.s.sol` · `src/MerkleAirdrop.sol`
+
+#### Description
+
+Recipients were selected based on their Ethereum L1 activity and their **Ethereum addresses** were encoded into the Merkle tree. The contract is deployed on **zkSync Era**, which features native Account Abstraction (AA). AA wallet contracts derive their on-chain addresses from chain-specific factory calls and initialization parameters — an AA wallet at address `X` on Ethereum Mainnet is at a **different address** on zkSync Era.
+
+Any recipient whose eligible address is an AA wallet will have a different address on zkSync. Their zkSync address produces a different Merkle leaf, which fails proof verification against the stored root.
+
+```solidity
+// makeMerkle.js — Ethereum L1 addresses encoded:
+const values = [
+    ["0x20F41376c713072937eb02Be70ee1eD0D639966C", amount],  // @> ETH L1 address
+    ["0x277D26a45Add5775F21256159F089769892CEa5B", amount],  // @> ETH L1 address
+    ["0x0c8Ca207e27a1a8224D1b602bf856479b03319e7", amount],  // @> ETH L1 address
+    ["0xf6dBa02C01AF48Cf926579F77C9f874Ca640D91D", amount],  // @> ETH L1 address
+]
+
+// src/MerkleAirdrop.sol — deployed on zkSync Era:
+function claim(address account, uint256 amount, bytes32[] calldata merkleProof) external payable {
+    bytes32 leaf = keccak256(bytes.concat(keccak256(abi.encode(account, amount))));
+    // @> If account = user's zkSync AA address (≠ their ETH L1 address),
+    // @> leaf will not match the stored root → always reverts
+    if (!MerkleProof.verify(merkleProof, i_merkleRoot, leaf)) {
+        revert MerkleAirdrop__InvalidProof();
+    }
+}
+```
+
+#### Risk
+
+**Likelihood:**
+- zkSync Era was built with native AA as a first-class feature; a significant portion of its active users interact via AA wallets (Argent, ZKsync native wallets, social recovery wallets).
+- The README explicitly states recipients were chosen based on Ethereum L1 activity, confirming the encoded addresses are L1-derived and may not match the users' zkSync counterparts.
+
+**Impact:**
+- Any recipient using an AA wallet is permanently unable to claim their 25 USDC — their zkSync address is not in the Merkle tree, producing an `InvalidProof` revert on every attempt.
+- `i_merkleRoot` is `immutable`; there is no on-chain resolution without full redeployment with zkSync-specific addresses.
+
+#### Proof of Concept
+
+```
+1. Recipient uses Argent AA wallet:
+   - Ethereum Mainnet address: 0x20F41376c713072937eb02Be70ee1eD0D639966C (in Merkle tree)
+   - zkSync Era address:        0xDEAD...BEEF (different — chain-specific factory deployment)
+
+2. User calls:
+   claim(0xDEAD...BEEF, 25e6, proof_for_0x20F41376...)
+   
+   → leaf computed = keccak256(keccak256(abi.encode(0xDEADBEEF, 25e6)))
+   → stored leaf   = keccak256(keccak256(abi.encode(0x20F41376..., 25e6)))
+   → MerkleProof.verify() returns false
+   → reverts: MerkleAirdrop__InvalidProof
+
+3. User's 25 USDC is permanently inaccessible.
+```
+
+#### Recommended Mitigation
+
+```diff
+// makeMerkle.js — use each recipient's zkSync Era address, not their ETH L1 address:
+
+  const values = [
+-     ["0x20F41376c713072937eb02Be70ee1eD0D639966C", amount],
++     ["<recipient_1_zksync_era_address>", amount],
+-     ["0x277D26a45Add5775F21256159F089769892CEa5B", amount],
++     ["<recipient_2_zksync_era_address>", amount],
+-     ["0x0c8Ca207e27a1a8224D1b602bf856479b03319e7", amount],
++     ["<recipient_3_zksync_era_address>", amount],
+-     ["0xf6dBa02C01AF48Cf926579F77C9f874Ca640D91D", amount],
++     ["<recipient_4_zksync_era_address>", amount],
+  ]
+
+// Before regenerating: confirm with each recipient whether they use an AA wallet
+// on zkSync Era and collect their chain-specific address accordingly.
+```
+
+---
+
+### [L-01] ETH Claim Fee Is Economically Impractical for the Owner to Recover
+
+**Affected Files**: `src/MerkleAirdrop.sol`
+
+#### Description
+
+`FEE = 1e9` (1 gwei) is a `private constant` with no owner-adjustable setter. On zkSync Era with an average gas price of ~0.02 gwei, the gas cost to call `claimFees()` is approximately `30,479 gas × 0.02 gwei ≈ 609 gwei`. The owner must accumulate at least **609 successful claims** before `claimFees()` becomes net-positive — but the entire airdrop only has 4 eligible recipients, meaning the fee revenue (`4 × 1 gwei = 4 gwei`) is approximately **152× less** than the cost to withdraw it.
+
+```solidity
+// src/MerkleAirdrop.sol
+
+uint256 private constant FEE = 1e9; // @> 1 gwei — hardcoded, no setter
+
+function claimFees() external onlyOwner {
+    (bool succ,) = payable(owner()).call{ value: address(this).balance }("");
+    if (!succ) {
+        revert MerkleAirdrop__TransferFailed();
+    }
+    // @> Owner pays ~609 gwei in gas to recover 4 gwei in fees — net loss of ~605 gwei
+}
+```
+
+#### Risk
+
+**Likelihood:**
+- With only 4 eligible addresses, maximum fee revenue is 4 gwei — well below the gas break-even threshold for `claimFees()` on any network.
+
+**Impact:**
+- The fee mechanism creates a net economic loss for the owner on every withdrawal attempt; the 4 gwei in fees is effectively unrecoverable in practice.
+
+#### Recommended Mitigation
+
+```diff
+// Option A — Remove the fee entirely (simplest):
+- uint256 private constant FEE = 1e9;
+- if (msg.value != FEE) { revert MerkleAirdrop__InvalidFeeAmount(); }
+
+// Option B — Make the fee owner-adjustable:
++ uint256 private s_fee = 1e9;
++ function setFee(uint256 newFee) external onlyOwner { s_fee = newFee; }
+- if (msg.value != FEE) { revert MerkleAirdrop__InvalidFeeAmount(); }
++ if (msg.value != s_fee) { revert MerkleAirdrop__InvalidFeeAmount(); }
+```
+
+---
+
+### [I-01] Dead `MerkleRootUpdated` Event Will Never Be Emitted
+
+**Affected Files**: `src/MerkleAirdrop.sol`
+
+#### Description
+
+`event MerkleRootUpdated(bytes32 newMerkleRoot)` is declared but `i_merkleRoot` is `immutable` with no setter function, making the event permanently unreachable. Off-chain indexers expecting to track root changes will receive no events, and the absence of a root-rotation function means a misconfigured root requires full redeployment.
+
+#### Recommended Mitigation
+
+Remove the dead event declaration, or implement the intended root-rotation function:
+
+```diff
+- event MerkleRootUpdated(bytes32 newMerkleRoot);
+```
+
+---
+
+## Audit Statistics
+
+| Category | Count |
+|----------|-------|
+| High Severity | 4 |
+| Medium Severity | 0 |
+| Low Severity | 1 |
+| Informational | 1 |
+| False Positives | 0 |
+| **H/M Match Rate** | **4/4 (100%)** |
+
+---
+
+## Key Lessons From This Audit
+
+1. **Never remove in-scope files**: `Deploy.s.sol` was explicitly in scope; 3 of 4 High findings lived there.
+2. **Address literal typos in deploy scripts are High severity**: Two characters differing in a hardcoded address renders the entire protocol non-functional.
+3. **Decimal awareness is critical for USDC/USDT integrations**: Always verify whether amounts in Merkle trees, test fixtures, and funding steps use the token's actual decimal count (6 for USDC, not 18).
+4. **zkSync deployments require chain-specific address validation**: Ethereum L1 addresses are not guaranteed to match their zkSync Era equivalents for Account Abstraction wallet users — always confirm target-chain addresses before encoding them into immutable Merkle roots.
+5. **`hasClaimed` is a mandatory pattern for any Merkle airdrop**: The absence of replay protection is the canonical H/C finding in all Merkle distribution contracts.
+
+---
+
+## Tools Used
+
+| Tool | Purpose | Result |
+|------|---------|--------|
+| Manual review | Full line-by-line audit of both files | All 4 H findings identified |
+| Python address comparison | Confirmed Deploy.s.sol address mismatch | H-01 confirmed |
+| Stateless fuzz tests | Wrong fee/amount/double-claim edge cases | H-02 confirmed |
+| Invariant tests | Single-claim-per-account invariant | H-02 confirmed |
+| Pashov x-ray | Pre-audit scan, threat model, git analysis | H-01, H-02, H-03 identified |
+| Pashov solidity-auditor (8 agents) | Parallel security review | H-02 confirmed by all 8 agents |
+| Slither | Static analysis | Could not compile (missing deps) |
+| zkSync architecture review | Chain-specific address behavior | H-04 identified |
+
+---

@@ -13,7 +13,7 @@ Currently training at **Cyfrin Updraft**.
 | Algo Stablecoins | 1 High, 1 Medium | CodeHawks / First Flights | [View Report](./reports/algo-stablecoins-audit-report.md) |
 | Santa's List | 5 High, 1 Medium | CodeHawks / First Flights | [View Report](./reports/santas-list-audit-report.md) |
 | BeatLand Festival | 1 High, 3 Medium | CodeHawks / First Flights | [View Report](./reports/beatland-festival-audit-report.md) |
-
+| AirDropper (MerkleAirdrop) | 4 High, 1 Low, 1 Informational | CodeHawks / First Flights | [View Report](./reports/AirDropper%20(MerkleAirdrop)%20%7C%20AI%20First%20Flight%20%235%20%7C%20CodeHawks) |
 
 
 ---

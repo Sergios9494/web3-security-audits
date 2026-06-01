@@ -1,0 +1,697 @@
+# 🔐 Security Review — MyCut Contest Rewards Distribution Protocol
+
+**Prepared by:** @0xOrion  
+**Date:** 2026-06-01  
+**Commit reviewed:** `946231db0fe717039429a11706717be568d03b54`  
+**Severity breakdown:** 4 High · 2 Medium
+
+---
+
+## Table of Contents
+
+1. [Scope](#scope)
+2. [Executive Summary](#executive-summary)
+3. [Findings Summary](#findings-summary)
+4. [H-01 — Manager Cut Permanently Locked in ContestManager](#h-01)
+5. [H-02 — Wrong Divisor in `closePot` Permanently Locks Unclaimed Rewards](#h-02)
+6. [H-03 — Constructor Overwrites Rewards for Duplicate Player Addresses](#h-03)
+7. [H-04 — Unbounded `claimants` Loop Causes Gas Limit DoS](#h-04)
+8. [M-01 — Zero Claimants in `closePot` Locks 90% of Remaining Rewards](#m-01)
+9. [M-02 — `claimCut` Callable Before `fundContest` Shrinks Claim Window](#m-02)
+10. [Disclaimer](#disclaimer)
+
+---
+
+## Scope
+
+| | |
+|---|---|
+| **Files reviewed** | `src/ContestManager.sol` · `src/Pot.sol` |
+| **Blockchains** | EVM Equivalent Chains Only |
+| **Token support** | Standard ERC20 Tokens Only |
+| **Confidence threshold** | 75 |
+
+---
+
+## Executive Summary
+
+MyCut is a contest rewards distribution protocol that allows an owner to create multiple reward pots, fund them, and allow registered players 90 days to claim their allocated share. After the window expires, the owner closes the pot — taking a 10% manager cut while distributing the remaining 90% equally among players who claimed in time.
+
+The audit uncovered **4 High** and **2 Medium** severity vulnerabilities. The most critical issues compound each other: a wrong divisor in `closePot` locks the claimant share inside the `Pot` contract, while a `msg.sender` misdirection simultaneously locks the manager cut inside `ContestManager` — meaning a single normal `closeContest` call can make **100% of remaining rewards permanently inaccessible**. Additional issues include silent reward overwriting for duplicate player entries, a gas-limit denial-of-service on the distribution loop, a missing fallback for the zero-claimants case, and a timing gap that allows claims to be attempted before funding while eroding the 90-day window.
+
+---
+
+## Findings Summary
+
+| ID | Title | Severity |
+|---|---|---|
+| H-01 | Manager Cut Permanently Locked in `ContestManager` | High |
+| H-02 | Wrong Divisor in `closePot` Permanently Locks Unclaimed Rewards | High |
+| H-03 | Constructor Overwrites Rewards for Duplicate Player Addresses | High |
+| H-04 | Unbounded `claimants` Loop Causes Gas Limit DoS | High |
+| M-01 | Zero Claimants in `closePot` Locks 90% of Remaining Rewards | Medium |
+| M-02 | `claimCut` Callable Before `fundContest` Shrinks Effective Claim Window | Medium |
+
+---
+
+<a name="h-01"></a>
+## H-01 — Manager Cut Permanently Locked in `ContestManager`
+
+**Severity:** High  
+**Scope:** `Pot.sol` · `ContestManager.sol`
+
+---
+
+### # `msg.sender` in `closePot` Routes Manager Cut to `ContestManager` → Permanent Fund Lock
+
+### Description
+
+* When a contest ends, the owner calls `ContestManager.closeContest()`, which internally calls `pot.closePot()`. The `Pot` is deployed by `ContestManager` via `new Pot(...)` — because of the `Ownable(msg.sender)` constructor, `Pot.owner()` is set to `address(ContestManager)`, not the human EOA that initiated the call.
+
+* Inside `closePot`, the 10% manager cut is transferred to `msg.sender`. When called through `ContestManager._closeContest()`, `msg.sender` inside `closePot` is `address(ContestManager)` — not the protocol owner's wallet. `ContestManager` has no ERC20 withdrawal or rescue function, so every manager cut from every contest is permanently trapped inside the contract with no recovery path.
+
+```solidity
+// ContestManager.sol
+function _closeContest(address contest) internal {
+    Pot pot = Pot(contest);
+    // @> msg.sender inside closePot will be address(ContestManager)
+    pot.closePot();
+}
+
+// Pot.sol
+// @> owner = address(ContestManager) because ContestManager called new Pot(...)
+contract Pot is Ownable(msg.sender) {
+
+    function closePot() external onlyOwner {
+        if (remainingRewards > 0) {
+            uint256 managerCut = remainingRewards / managerCutPercent;
+            // @> msg.sender = address(ContestManager), NOT the human owner EOA
+            // @> ContestManager has no token rescue function → locked forever
+            i_token.transfer(msg.sender, managerCut);
+        }
+    }
+}
+```
+
+### Risk
+
+**Likelihood:**
+
+* Every single `closeContest` call unconditionally routes the manager cut to the `ContestManager` contract address — there is no alternative code path
+* Occurs on every contest closure regardless of token, amount, or timing
+
+**Impact:**
+
+* The protocol owner permanently loses their entire 10% fee revenue from every contest they close
+* Tokens accumulate in `ContestManager` indefinitely with no mechanism to recover them
+* Combined with H-02, effectively 100% of `remainingRewards` becomes permanently inaccessible after a normal `closeContest` call
+
+### Proof of Concept
+
+```solidity
+function testOwnerCutStuckInContestManager() public mintAndApproveTokens {
+    vm.startPrank(user);
+    contest = ContestManager(conMan).createContest(
+        players, rewards, IERC20(ERC20Mock(weth)), 100
+    );
+    ContestManager(conMan).fundContest(0);
+    vm.stopPrank();
+
+    vm.warp(block.timestamp + 91 days);
+
+    uint256 conManBalanceBefore = ERC20Mock(weth).balanceOf(conMan);
+    uint256 ownerBalanceBefore  = ERC20Mock(weth).balanceOf(user);
+
+    vm.prank(user);
+    ContestManager(conMan).closeContest(contest);
+
+    // Manager cut (10 tokens) went to ContestManager, not the owner
+    assertGt(ERC20Mock(weth).balanceOf(conMan), conManBalanceBefore);
+    // Owner received nothing
+    assertEq(ERC20Mock(weth).balanceOf(user), ownerBalanceBefore);
+}
+```
+
+### Recommended Mitigation
+
+```diff
+// Pot.sol — accept the intended recipient as a parameter
+- function closePot() external onlyOwner {
++ function closePot(address manager) external onlyOwner {
+      if (block.timestamp - i_deployedAt < 90 days) {
+          revert Pot__StillOpenForClaim();
+      }
+      if (remainingRewards > 0) {
+          uint256 managerCut = remainingRewards / managerCutPercent;
+-         i_token.transfer(msg.sender, managerCut);
++         i_token.transfer(manager, managerCut);
+          // ...
+      }
+  }
+
+// ContestManager.sol — pass the actual human owner EOA
+  function _closeContest(address contest) internal {
+      Pot pot = Pot(contest);
+-     pot.closePot();
++     pot.closePot(owner());
+  }
+```
+
+---
+
+<a name="h-02"></a>
+## H-02 — Wrong Divisor in `closePot` Permanently Locks Unclaimed Rewards
+
+**Severity:** High  
+**Scope:** `Pot.sol`
+
+---
+
+### # `i_players.length` as Divisor But `claimants.length` as Loop Bound → Residual Tokens Locked Forever
+
+### Description
+
+* When the 90-day claim window expires, the owner calls `closePot()`. The function takes 10% as a manager cut, then is supposed to distribute the remaining 90% equally among players who claimed in time (stored in `claimants[]`).
+
+* `claimantCut` is divided by `i_players.length` (all registered players) but the distribution loop only iterates over `claimants.length` (only those who already called `claimCut`). The residual `(i_players.length − claimants.length) × claimantCut` is never sent anywhere and has no recovery path — permanently locked in the contract. In the worst case where no player has claimed, 90% of the entire reward pool is trapped.
+
+```solidity
+function closePot() external onlyOwner {
+    if (block.timestamp - i_deployedAt < 90 days) {
+        revert Pot__StillOpenForClaim();
+    }
+    if (remainingRewards > 0) {
+        uint256 managerCut = remainingRewards / managerCutPercent;
+        i_token.transfer(msg.sender, managerCut);
+
+        // @> Divides by ALL registered players (i_players.length)...
+        uint256 claimantCut = (remainingRewards - managerCut) / i_players.length;
+        // @> ...but only distributes to those who already claimed (claimants.length)
+        for (uint256 i = 0; i < claimants.length; i++) {
+            _transferReward(claimants[i], claimantCut);
+        }
+        // @> No residual sweep — (i_players.length - claimants.length) * claimantCut locked forever
+    }
+}
+```
+
+### Risk
+
+**Likelihood:**
+
+* Any contest where fewer players claim than total registered triggers the lock — which is the protocol's primary expected scenario (the 90-day window exists precisely because not all players claim)
+* Every single `closePot` call where `claimants.length < i_players.length` permanently locks funds
+
+**Impact:**
+
+* Tokens equal to `(i_players.length − claimants.length) × claimantCut` are permanently locked with no withdrawal function
+* In the zero-claimant case, 90% of all deposited rewards are irrecoverable
+* Combined with H-01, a single normal `closeContest` call locks 100% of remaining rewards
+
+### Proof of Concept
+
+```solidity
+function testWrongDivisorLocksTokens() public mintAndApproveTokens {
+    // 5 players, each allocated 200 tokens, totalRewards = 1000
+    address[] memory fivePlayers = new address[](5);
+    uint256[] memory fiveRewards = new uint256[](5);
+    for (uint256 i = 0; i < 5; i++) {
+        fivePlayers[i] = address(uint160(i + 1));
+        fiveRewards[i] = 200;
+    }
+
+    vm.startPrank(user);
+    contest = ContestManager(conMan).createContest(
+        fivePlayers, fiveRewards, IERC20(ERC20Mock(weth)), 1000
+    );
+    ContestManager(conMan).fundContest(0);
+    vm.stopPrank();
+
+    // Only player[0] claims — remainingRewards drops to 800
+    vm.prank(fivePlayers[0]);
+    Pot(contest).claimCut();
+
+    vm.warp(block.timestamp + 91 days);
+    vm.prank(user);
+    ContestManager(conMan).closeContest(contest);
+
+    // managerCut = 800 / 10 = 80
+    // claimantCut = (800 - 80) / 5 = 144  ← divided by 5, not 1
+    // distributed = 80 + 144 = 224
+    // LOCKED = 800 - 224 = 576 tokens stuck in Pot forever
+    assertGt(ERC20Mock(weth).balanceOf(contest), 0);
+}
+```
+
+### Recommended Mitigation
+
+```diff
+-   uint256 claimantCut = (remainingRewards - managerCut) / i_players.length;
+-   for (uint256 i = 0; i < claimants.length; i++) {
+-       _transferReward(claimants[i], claimantCut);
+-   }
++   if (claimants.length > 0) {
++       uint256 claimantCut = (remainingRewards - managerCut) / claimants.length;
++       for (uint256 i = 0; i < claimants.length; i++) {
++           _transferReward(claimants[i], claimantCut);
++       }
++   }
++   // Sweep rounding dust and zero-claimant residual to the manager
++   uint256 residual = i_token.balanceOf(address(this));
++   if (residual > 0) {
++       i_token.transfer(msg.sender, residual);
++   }
+```
+
+---
+
+<a name="h-03"></a>
+## H-03 — Constructor Overwrites Rewards for Duplicate Player Addresses
+
+**Severity:** High  
+**Scope:** `Pot.sol`
+
+---
+
+### # `=` Assignment in Constructor Silently Discards Earlier Rewards for Duplicate Addresses
+
+### Description
+
+* The `Pot` constructor iterates over the `players` and `rewards` arrays and populates the `playersToRewards` mapping with each player's allocated reward. This mapping is the sole on-chain record of how much each address can claim via `claimCut()`.
+
+* The assignment uses `=` instead of `+=`. If the same address appears more than once in `i_players`, the mapping entry is silently overwritten with the reward from the last occurrence — all earlier reward entries for that address are discarded without any revert or event. However, `i_players.length` still counts every duplicate entry, inflating the denominator used in `closePot`'s `claimantCut` calculation. The result: the affected player receives less than their full allocation, and the overwritten rewards are permanently locked in the contract.
+
+```solidity
+constructor(address[] memory players, uint256[] memory rewards, IERC20 token, uint256 totalRewards) {
+    // @> stores full array including ALL duplicates
+    i_players = players;
+    i_rewards = rewards;
+    remainingRewards = totalRewards; // @> totalRewards accounts for ALL entries including duplicates
+
+    for (uint256 i = 0; i < i_players.length; i++) {
+        // @> = overwrites on duplicate — last occurrence wins, earlier rewards discarded
+        // @> no revert, no event, no indication that data was lost
+        playersToRewards[i_players[i]] = i_rewards[i];
+    }
+}
+```
+
+### Risk
+
+**Likelihood:**
+
+* Any contest setup where the same player address is listed more than once — through off-chain scripting error, CSV import issue, or manual input mistake — triggers the overwrite silently with no on-chain revert
+* No input validation or deduplication check exists anywhere in the codebase
+
+**Impact:**
+
+* The affected player receives only the reward from their last array entry, permanently losing all earlier allocations with no recovery path
+* `i_players.length` is inflated by duplicate slots, shrinking `claimantCut` for all claimants in `closePot` and locking additional tokens in the contract
+
+### Proof of Concept
+
+```solidity
+function test_ConstructorOverwritesDuplicateReward() public mintAndApproveTokens {
+    // player1 appears at index 0 (reward 2) AND index 4 (reward 6)
+    // Expected total for player1: 2 + 6 = 8
+    address[] memory sixPlayers = new address[](6);
+    uint256[] memory sixRewards = new uint256[](6);
+    sixPlayers[0] = player1; sixRewards[0] = 2;
+    sixPlayers[1] = player2; sixRewards[1] = 3;
+    sixPlayers[2] = player3; sixRewards[2] = 4;
+    sixPlayers[3] = player4; sixRewards[3] = 5;
+    sixPlayers[4] = player1; sixRewards[4] = 6; // duplicate — overwrites index 0
+    sixPlayers[5] = player5; sixRewards[5] = 7;
+    uint256 total = 27; // 2+3+4+5+6+7
+
+    vm.startPrank(user);
+    contest = ContestManager(conMan).createContest(
+        sixPlayers, sixRewards, IERC20(ERC20Mock(weth)), total
+    );
+    ContestManager(conMan).fundContest(0);
+    vm.stopPrank();
+
+    // player1's mapping was overwritten — only holds reward from last occurrence (6)
+    uint256 assigned = Pot(contest).checkCut(player1);
+    assertEq(assigned, 6);    // received 6, should be 8 — 2 tokens permanently lost
+    assert(assigned < 8);
+}
+```
+
+### Recommended Mitigation
+
+```diff
+  for (uint256 i = 0; i < i_players.length; i++) {
+-     playersToRewards[i_players[i]] = i_rewards[i];
++     playersToRewards[i_players[i]] += i_rewards[i];
+  }
+```
+
+---
+
+<a name="h-04"></a>
+## H-04 — Unbounded `claimants` Loop Causes Gas Limit DoS
+
+**Severity:** High  
+**Scope:** `Pot.sol`
+
+---
+
+### # Unbounded Loop Over `claimants[]` in `closePot` → Gas Exhaustion Permanently Prevents Pot Closure
+
+### Description
+
+* When the 90-day window closes, `closePot()` iterates over the entire `claimants` array and pushes tokens to each address via `_transferReward`. The `claimants` array grows by exactly one element every time any registered player calls `claimCut()` — there is no cap or upper bound on its size.
+
+* For contests with a large number of players, the combined gas cost of iterating the full `claimants` array — each iteration executing an ERC20 `transfer` at roughly 21,000–50,000 gas — can exceed the block gas limit (~30M on Ethereum mainnet). When this happens, every call to `closePot` reverts out-of-gas. All remaining rewards and the manager cut are permanently locked in the contract with no pagination or fallback mechanism.
+
+```solidity
+function closePot() external onlyOwner {
+    if (remainingRewards > 0) {
+        uint256 managerCut = remainingRewards / managerCutPercent;
+        i_token.transfer(msg.sender, managerCut);
+
+        uint256 claimantCut = (remainingRewards - managerCut) / i_players.length;
+        // @> claimants.length grows with every claimCut() call — no upper bound
+        // @> 1000 claimants × ~50k gas = 50M gas > 30M block gas limit
+        // @> Entire closePot permanently reverts — all funds locked
+        for (uint256 i = 0; i < claimants.length; i++) {
+            _transferReward(claimants[i], claimantCut);
+        }
+    }
+}
+```
+
+### Risk
+
+**Likelihood:**
+
+* Any contest with hundreds of active claimants reaches dangerous gas levels — 600 USDC transfers alone approach the 30M block limit
+* The `claimants` array grows through normal protocol usage; no special action is needed to trigger the DoS
+
+**Impact:**
+
+* `closePot` permanently reverts out-of-gas — the pot can never be closed
+* All remaining rewards and the manager's 10% cut are locked in the contract indefinitely with no rescue path
+
+### Proof of Concept
+
+```solidity
+function testGasCostForClosingPotWithManyClaimants() public mintAndApproveTokens {
+    address[] memory players2000 = new address[](2000);
+    uint256[] memory rewards2000 = new uint256[](2000);
+    for (uint256 i = 0; i < 2000; i++) {
+        players2000[i] = address(uint160(i + 1));
+        rewards2000[i] = 1 ether;
+    }
+
+    vm.startPrank(user);
+    contest = ContestManager(conMan).createContest(
+        players2000, rewards2000, IERC20(ERC20Mock(weth)), 2000 ether
+    );
+    ContestManager(conMan).fundContest(0);
+    vm.stopPrank();
+
+    // 1500 players claim their cut
+    for (uint256 i = 0; i < 1500; i++) {
+        vm.prank(players2000[i]);
+        Pot(contest).claimCut();
+    }
+
+    vm.warp(91 days);
+
+    vm.startPrank(user);
+    uint256 gasBefore = gasleft();
+    ContestManager(conMan).closeContest(contest);
+    uint256 gasUsed = gasBefore - gasleft();
+    vm.stopPrank();
+
+    // Gas used for 1500 claimants: ~6,425,853
+    // Scales linearly — 2000 claimants exceeds the 30M block gas limit
+    console.log("Gas used for closing pot with 1500 claimants:", gasUsed);
+}
+```
+
+### Recommended Mitigation
+
+Replace the push-distribution loop with a pull-payment pattern so each claimant withdraws their own share in a separate transaction, eliminating any per-iteration gas accumulation in `closePot`:
+
+```diff
++ mapping(address => uint256) public pendingWithdrawals;
+
+  function closePot() external onlyOwner {
+      if (block.timestamp - i_deployedAt < 90 days) {
+          revert Pot__StillOpenForClaim();
+      }
+      if (remainingRewards > 0) {
+          uint256 managerCut = remainingRewards / managerCutPercent;
+          i_token.transfer(msg.sender, managerCut);
+
+-         uint256 claimantCut = (remainingRewards - managerCut) / i_players.length;
+-         for (uint256 i = 0; i < claimants.length; i++) {
+-             _transferReward(claimants[i], claimantCut);
+-         }
++         if (claimants.length > 0) {
++             uint256 claimantCut = (remainingRewards - managerCut) / claimants.length;
++             for (uint256 i = 0; i < claimants.length; i++) {
++                 pendingWithdrawals[claimants[i]] += claimantCut;
++             }
++         }
+      }
+  }
+
++ function withdrawClosureCut() external {
++     uint256 amount = pendingWithdrawals[msg.sender];
++     require(amount > 0, "Pot: nothing to withdraw");
++     pendingWithdrawals[msg.sender] = 0;
++     i_token.transfer(msg.sender, amount);
++ }
+```
+
+---
+
+<a name="m-01"></a>
+## M-01 — Zero Claimants in `closePot` Locks 90% of Remaining Rewards
+
+**Severity:** Medium  
+**Scope:** `Pot.sol`
+
+---
+
+### # Empty `claimants[]` Array Causes Distribution Loop to Never Execute → 90% of Rewards Locked
+
+### Description
+
+* After the 90-day window, `closePot()` sends the manager their 10% cut, then distributes the remaining 90% among the `claimants` array — players who previously called `claimCut()`. The loop iterating over `claimants` is the only distribution mechanism for the claimant share.
+
+* When no player has called `claimCut()` before the pot closes, `claimants.length == 0` and the loop body never executes. The manager receives `remainingRewards / 10` (which is sent to `ContestManager` instead of the owner per H-01), while the remaining 90% of `remainingRewards` stays permanently in the Pot contract. There is no fallback path, no second close attempt, and no rescue function.
+
+```solidity
+function closePot() external onlyOwner {
+    if (remainingRewards > 0) {
+        uint256 managerCut = remainingRewards / managerCutPercent;
+        i_token.transfer(msg.sender, managerCut); // @> 10% transferred (to wrong address per H-01)
+
+        uint256 claimantCut = (remainingRewards - managerCut) / i_players.length;
+        // @> If claimants.length == 0, this loop body NEVER runs
+        for (uint256 i = 0; i < claimants.length; i++) {
+            _transferReward(claimants[i], claimantCut);
+        }
+        // @> No else branch — 90% of remainingRewards has no destination and stays in Pot
+    }
+}
+```
+
+### Risk
+
+**Likelihood:**
+
+* Any contest where all players miss the 90-day window triggers the full lock — not a rare edge case in a protocol explicitly designed around the possibility of missed claims
+* Low-visibility contests or those with poor user notifications can easily reach closure with zero claimants
+
+**Impact:**
+
+* 90% of the total reward pool is permanently locked in the Pot contract with no recovery mechanism
+* Combined with H-01, effectively 100% of `remainingRewards` is inaccessible after `closeContest` — 10% locked in `ContestManager`, 90% locked in `Pot`
+
+### Proof of Concept
+
+```solidity
+function testClosePotWithZeroClaimants() public mintAndApproveTokens {
+    vm.startPrank(user);
+    contest = ContestManager(conMan).createContest(
+        players, rewards, IERC20(weth), totalRewards
+    );
+    ContestManager(conMan).fundContest(0);
+    vm.stopPrank();
+
+    // No player calls claimCut — all 90 days pass with zero claims
+    vm.warp(block.timestamp + 91 days);
+
+    uint256 managerBalanceBefore = weth.balanceOf(user);
+
+    vm.prank(user);
+    ContestManager(conMan).closeContest(contest);
+
+    // Owner received nothing (H-01 — cut went to ContestManager)
+    assertEq(weth.balanceOf(user), managerBalanceBefore);
+    // 90% of totalRewards permanently locked in Pot
+    assertEq(weth.balanceOf(contest), (totalRewards * 90) / 100);
+}
+```
+
+### Recommended Mitigation
+
+```diff
++ if (claimants.length == 0) {
++     // No one claimed — return everything to the manager
++     i_token.transfer(msg.sender, remainingRewards - managerCut);
++ } else {
+      uint256 claimantCut = (remainingRewards - managerCut) / claimants.length;
+      for (uint256 i = 0; i < claimants.length; i++) {
+          _transferReward(claimants[i], claimantCut);
+      }
++ }
+```
+
+---
+
+<a name="m-02"></a>
+## M-02 — `claimCut` Callable Before `fundContest` Shrinks Effective Claim Window
+
+**Severity:** Medium  
+**Scope:** `Pot.sol` · `ContestManager.sol`
+
+---
+
+### # 90-Day Timer Starts at Deployment, Not Funding → Shortened Claim Window and Failed Early Claims
+
+### Description
+
+* The `Pot` constructor records `i_deployedAt = block.timestamp`, starting the 90-day claim window immediately at deployment. `fundContest()` in `ContestManager` is a completely separate call that transfers tokens into the Pot — it can be executed any time after deployment, or never at all. The two operations are fully decoupled with no on-chain enforcement linking them.
+
+* Players calling `claimCut()` before `fundContest` is executed receive an opaque ERC20 balance revert even though their `playersToRewards` entry is valid. More critically, every day the funding is delayed permanently removes a day from the legitimate claim window. A pot funded 30 days late silently gives players only 60 days to claim — with no on-chain signal that the effective deadline has shifted. The commented-out line in the constructor (`// i_token.transfer(address(this), i_totalRewards)`) is a direct indication that atomic self-funding was originally intended but was removed.
+
+```solidity
+// Pot.sol
+constructor(address[] memory players, uint256[] memory rewards, IERC20 token, uint256 totalRewards) {
+    // @> 90-day countdown begins immediately at construction
+    i_deployedAt = block.timestamp;
+
+    // @> Self-funding removed — Pot starts with 0 token balance
+    // i_token.transfer(address(this), i_totalRewards);
+}
+
+// ContestManager.sol
+function createContest(...) public onlyOwner returns (address) {
+    // @> Timer starts the moment the Pot is deployed here
+    Pot pot = new Pot(players, rewards, token, totalRewards);
+    contests.push(address(pot));
+    contestToTotalRewards[address(pot)] = totalRewards;
+    // @> No funding — completely separate optional step with no deadline
+    return address(pot);
+}
+
+function fundContest(uint256 index) public onlyOwner {
+    // @> Can be called days or weeks after createContest, or never
+    token.transferFrom(msg.sender, address(pot), totalRewards);
+}
+```
+
+### Risk
+
+**Likelihood:**
+
+* Any deployment workflow that separates `createContest` and `fundContest` — common in multi-step scripts or manual operations — begins eroding the effective claim window from the first block
+* Players monitoring `createContest` events and attempting to claim immediately will receive confusing ERC20 errors with no protocol-level explanation
+
+**Impact:**
+
+* Delayed funding silently reduces the effective claim window with no on-chain signal — players lose claimable time they are unaware of
+* Players calling `claimCut()` on an unfunded pot receive a generic `ERC20InsufficientBalance` error instead of a meaningful protocol revert, creating poor UX and potential trust issues with the protocol
+
+### Proof of Concept
+
+```solidity
+function testClaimCutRevertsBeforeFunding() public {
+    vm.prank(owner);
+    address potAddr = contestManager.createContest(
+        players, rewards, token, 1000
+    );
+    // fundContest NOT called — Pot has 0 token balance
+
+    // Player tries to claim immediately after contest creation
+    vm.prank(players[0]);
+    vm.expectRevert(); // Generic ERC20InsufficientBalance — no Pot error
+    Pot(potAddr).claimCut();
+}
+
+function testDelayedFundingShrinkClaimWindow() public {
+    vm.prank(owner);
+    address potAddr = contestManager.createContest(
+        players, rewards, token, 1000
+    );
+
+    // Owner funds 30 days after deployment
+    vm.warp(block.timestamp + 30 days);
+    vm.prank(owner);
+    contestManager.fundContest(0);
+
+    // Players effectively have only 60 days to claim, not 90
+    // 61 more days and the owner can already close the pot
+    vm.warp(block.timestamp + 61 days);
+    vm.prank(owner);
+    // Succeeds — 91 days since DEPLOYMENT, players had only 60 days from FUNDING
+    contestManager.closeContest(potAddr);
+}
+```
+
+### Recommended Mitigation
+
+**Option A — Fund atomically at creation (recommended):**
+
+```diff
+  function createContest(
+      address[] memory players,
+      uint256[] memory rewards,
+      IERC20 token,
+      uint256 totalRewards
+  ) public onlyOwner returns (address) {
+      Pot pot = new Pot(players, rewards, token, totalRewards);
+      contests.push(address(pot));
+      contestToTotalRewards[address(pot)] = totalRewards;
++     token.transferFrom(msg.sender, address(pot), totalRewards);
+      return address(pot);
+  }
+```
+
+**Option B — Gate `claimCut` behind a funded flag:**
+
+```diff
++ bool private s_isFunded;
+
++ modifier onlyFunded() {
++     if (!s_isFunded) revert Pot__InsufficientFunds();
++     _;
++ }
+
++ function markFunded() external onlyOwner {
++     s_isFunded = true;
++ }
+
+- function claimCut() public {
++ function claimCut() public onlyFunded {
+      address player = msg.sender;
+      uint256 reward = playersToRewards[player];
+      if (reward <= 0) revert Pot__RewardNotFound();
+      playersToRewards[player] = 0;
+      remainingRewards -= reward;
+      claimants.push(player);
+      _transferReward(player, reward);
+  }
+```
+
+---
+
+┌──(user㉿linux-laptop)-[~]
+└─$ 

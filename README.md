@@ -14,7 +14,7 @@ Currently training at **Cyfrin Updraft**.
 | Santa's List | 5 High, 1 Medium | CodeHawks / First Flights | [View Report](./reports/santas-list-audit-report.md) |
 | BeatLand Festival | 1 High, 3 Medium | CodeHawks / First Flights | [View Report](./reports/beatland-festival-audit-report.md) |
 | AirDropper (MerkleAirdrop) | 4 High, 1 Low, 1 Informational | CodeHawks / First Flights | [View Report](./reports/AirDropper%20(MerkleAirdrop)%20%7C%20AI%20First%20Flight%20%235%20%7C%20CodeHawks) |
-| MyCut | 4 High, 2 Medium | Pashov AI | [View Report](./reports/mycut-audit-report-20260601-124020.md) |
+| MyCut | 4 High, 2 Medium | Pashov AI | [View Report] ./reports/MyCut Contest Rewards Distribution Protocol | 
 
 
 ---
